@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+
+# Runtime / generated
+.langgraph_api/
+resources/
+cache/
+ragas_results.csv
+ragas_report_*.md
+
+image.png

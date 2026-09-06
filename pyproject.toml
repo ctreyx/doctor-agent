@@ -1,0 +1,37 @@
+[project]
+name = "doctor-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "dashscope>=1.27.3",
+    "langchain>=1.4.0",
+    "langchain-classic>=1.0.8",
+    "langchain-community>=0.4.2",
+    "langchain-core>=1.6.1",
+    "langchain-deepseek>=1.1.0",
+    "langchain-pinecone>=0.2.13",
+    "langchain-tavily>=0.2.18",
+    "langchain-text-splitters>=1.1.2",
+    "langgraph>=1.2.11",
+    "langgraph-checkpoint-sqlite>=3.1.1",
+    "pinecone>=7.3.0,<8.0.0",
+    "python-dotenv>=1.2.3",
+    "rank-bm25>=0.2.2",
+    "sentence-transformers>=6.0.1",
+    "tiktoken>=0.8.0",
+    "torch>=2.14.0",
+]
+
+[project.scripts]
+doctor-agent = "doctor_agent:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "langgraph-cli[inmem]>=0.4.31",
+]

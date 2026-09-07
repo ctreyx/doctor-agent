@@ -20,3 +20,6 @@ ragas_results.csv
 ragas_report_*.md
 
 image.png
+
+# IDE
+.idea/

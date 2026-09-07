@@ -191,7 +191,7 @@ uv sync
 ### 3. 启动 LangGraph Server
 
 ```powershell
-langgraph dev
+.\.venv\Scripts\langgraph.exe dev --port 8123
 ```
 
 入口由 `langgraph.json` 指定为 `./main.py:graph`。

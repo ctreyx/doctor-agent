@@ -46,10 +46,29 @@
 
 ```
 doctor-agent/
-├── main.py                    # 主程序（约 640 行）：数据加载 → 检索 → LangGraph 图
+├── main.py                    # 应用入口（薄入口）：加载环境变量 → 组装图 → re-export
+├── doctor_agent/              # 核心包（业务逻辑，14 个模块）
+│   ├── __init__.py            # 包文档 + 版本号
+│   ├── config.py              # 全局配置中心（路径 / 阈值 / 模型名 / 开关）
+│   ├── state.py               # LangGraph 图状态（State TypedDict）
+│   ├── document_loader.py     # CSV 加载 / 清洗 / 切分 / 缓存
+│   ├── embeddings.py          # DashScope embedding 封装
+│   ├── vector_store.py        # Pinecone 初始化 + 增量写入
+│   ├── retrieval.py           # 混合检索 + CrossEncoder 重排
+│   ├── llm.py                 # LLM 工厂（生成 / 校验模型）
+│   ├── prompts.py             # 所有提示词模板
+│   ├── tools.py               # 检索工具 + Tavily + 消息辅助
+│   ├── nodes/                 # 图节点（职责单一）
+│   │   ├── guard.py           #   越权守卫
+│   │   ├── rewrite.py         #   查询改写（语义漂移）
+│   │   ├── retrieve.py        #   检索 + 路由
+│   │   ├── web_search.py      #   联网兜底
+│   │   ├── generate.py        #   生成
+│   │   └── grade.py           #   Self-RAG 校验
+│   └── graph.py               # 图组装（build_graph）
 ├── evaluate.py                # RAGAS 评测脚本（抽样本 → 检索生成 → 打分 → LLM 报告）
 ├── guard_eval.py              # 越权拦截测试（7 条用例，含 5 越权 + 2 正常对照）
-├── test_semantic_drift.py     # 语义漂移对照实验（12 条追问用例，开/关 rewrite 对比）
+├── test_semantic_drift.py     # 语义漂移对照实验（追问用例，开/关 rewrite 对比）
 ├── datas/
 │   └── zhongliu.csv           # 肿瘤科问答数据（GB18030 编码，4 列）
 ├── prompts/
@@ -57,7 +76,6 @@ doctor-agent/
 ├── pyproject.toml             # 依赖声明（uv）
 ├── langgraph.json             # LangGraph Server 配置（入口 ./main.py:graph）
 ├── cache/                     # 切分缓存（增量失效，避免重复切分）
-├── src/doctor_agent/          # 包目录（目前基本为空，主逻辑在根目录 main.py）
 ├── .env                       # 密钥（不入库）
 └── ragas_results.csv / ragas_report_*.md  # 评测输出
 ```
@@ -83,13 +101,13 @@ flowchart TD
     FB --> GEN
 ```
 
-> `rewrite` 节点可用模块级开关 `ENABLE_REWRITE` 跳过（用于对照实验复现语义漂移）。
+> `rewrite` 节点可用开关 `config.ENABLE_REWRITE` 跳过（用于对照实验复现语义漂移）。
 
 ---
 
 ## 五、State 状态字段
 
-定义在 `main.py` 的 `class State(TypedDict)`：
+定义在 `doctor_agent/state.py` 的 `class State(TypedDict)`：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -108,46 +126,30 @@ flowchart TD
 
 ## 六、各模块详解
 
-### 1. 数据层（`main.py` 顶部）
+核心业务逻辑按职责拆分到 ``doctor_agent`` 包，每个模块单一职责：
 
-- `clean_text()`：去 HTML 标签、全角空格、制表符，合并连续空白。
-- `load_csv_documents()`：读 `datas/zhongliu.csv`（**GB18030 编码**），按行解析成 `Document`；短答案整行一条，长答案按 `RecursiveCharacterTextSplitter`（chunk 500 / overlap 80）切分，每块带上 `title + ask` 作为上下文。
-- 缓存机制：`get_or_build_chunks()` 用 `PROCESS_VERSION + 原文` 的 MD5 做缓存 key；`cache/index_manifest.json` 记录每个 chunk 的 hash，只增量 upsert「新内容」。
+| 模块 | 职责 | 关键内容 |
+|---|---|---|
+| `config.py` | 全局配置中心 | 所有路径、阈值、模型名、开关常量（唯一修改入口） |
+| `state.py` | 图状态定义 | `State(TypedDict)`，10 个字段 |
+| `document_loader.py` | 数据层 | `clean_text` / `load_csv_documents` / `get_documents`（惰性单例 + 磁盘缓存） |
+| `embeddings.py` | Embedding | `DashScopeTextEmbeddingV3` + `get_embeddings`（惰性单例） |
+| `vector_store.py` | 向量库 | `get_index`（惰性连接）/ `upsert_documents`（增量写入） |
+| `retrieval.py` | 检索层 | `get_retrieval` / `rerank_documents` / `format_context` |
+| `llm.py` | 模型工厂 | `get_llm`（生成）/ `get_grader_llm`（低温校验） |
+| `prompts.py` | 提示词 | `SYSTEM_PROMPT` + 改写 / 守卫 / 校验模板 |
+| `tools.py` | 工具 | `search_medical_knowledge` / `tavily_tool` / `latest_user_query` |
+| `nodes/` | 图节点 | guard / rewrite / retrieve / web_search / generate / grade |
+| `graph.py` | 图组装 | `build_graph()` 注册节点并连线 |
 
-### 2. Embedding 与向量库
+各层要点：
 
-- `DashScopeTextEmbeddingV3`：自实现 `Embeddings` 接口，调用 DashScope `text-embedding-v3`，1024 维，`query`/`document` 两种 text_type。
-- Pinecone：索引 `demo`，增量写入由开关 `is_import_enabled` 控制（当前 `False`，跳过导入）。
-
-### 3. 检索层
-
-- `_get_retrieval()`：惰性单例，首次调用才初始化（CrossEncoder 下载 + BM25 建索引都很重，避免 Server 启动卡住）。
-- `rerank_documents()`：CrossEncoder + Sigmoid 重排，返回 `[(score, doc)]` 降序，取 top 3。
-- `route()`：`score ≥ 0.6` → `generate`；否则 → `web_search`。
-
-### 4. 生成层
-
-- `generate_node()`：把检索结果拼进 system prompt（`prompts/doctor_prompt.md` + `【参考资料】`），调 DeepSeek 生成。
-- 历史上限 `MAX_MESSAGES = 20` 防超长。
-
-### 5. Self-RAG 校验层
-
-- `GradeHallucinations`：判断答案是否**基于检索事实**（防幻觉）。
-- `GradeAnswer`：判断答案是否**解决了用户问题**（防答非所问）。
-- 校验用低温模型 `temperature=0`。
-- `route_after_grade()`：通过或 `attempts ≥ MAX_ATTEMPTS(3)` → 结束；否则 → `feedback` 注入反馈重生成。
-
-### 6. 越权守卫（Guard）
-
-- `GuardResult`：`is_blocked` / `reason` / `reply` 三个字段。
-- `guard_prompt` 定义 6 类越权：非医疗、开处方/指定剂量、伪造证明、自伤/伤害意图、法律金融、色情暴力。
-- `guard_node` 在检索前拦截；被拦截走 `blocked_node` 返回温和拒绝话术。
-
-### 7. 查询改写（Rewrite，消除语义漂移）
-
-- `rewrite_chain`：把「聊天历史 + 最新追问」改写成不依赖历史的完整查询。
-- `rewrite_query_node`：取最近 6 条历史（3 轮），去掉最后一条追问，交给 LLM 改写；首轮无历史则原样返回。
-- 开关 `ENABLE_REWRITE`：`True` 走 `guard → rewrite → retrieve`；`False` 直接 `guard → retrieve`（用于复现漂移）。
+- **数据层**：`datas/zhongliu.csv`（GB18030 编码）清洗后按行解析成 `Document`；短答案整条保留，长答案按 `CHUNK_SIZE=500 / CHUNK_OVERLAP=80` 递归切分；`cache/` 用内容 hash 做增量失效，`index_manifest.json` 记录向量库写入清单。
+- **检索层**：Pinecone 向量 + BM25 关键词 → `EnsembleRetriever`（权重 0.6/0.4）→ CrossEncoder（Sigmoid）重排 top3；所有重资源（模型下载、索引构建、连接）均惰性初始化，避免 Server 启动卡住。
+- **生成层**：检索结果注入 system prompt（`prompts/doctor_prompt.md` + `【参考资料】`），历史上限 `MAX_MESSAGES=20`。
+- **Self-RAG 校验**：`GradeHallucinations`（防幻觉）+ `GradeAnswer`（防答非所问），低温模型 `temperature=0`；不通过则 `feedback` 注入重生成，上限 `MAX_ATTEMPTS=3`。
+- **越权守卫**：`GuardResult`（is_blocked/reason/reply）拦截 6 类越权请求，被拦截走 `blocked_node` 返回温和拒绝话术。
+- **查询改写**：`rewrite_query_node` 把追问残句改写成完整查询；开关 `config.ENABLE_REWRITE`（True 走 rewrite，False 跳过复现漂移）。
 
 ---
 
@@ -219,15 +221,15 @@ langgraph dev
 
 | 参数 | 位置 | 值 |
 |---|---|---|
-| `RAG_MIN_SCORE` | `main.py` | 0.6（低于此值走联网） |
-| `MAX_ATTEMPTS` | `main.py` | 3（Self-RAG 重试上限） |
-| `ENABLE_REWRITE` | `main.py` | True（语义漂移开关） |
-| chunk_size / overlap | `main.py` | 500 / 80 |
-| embedding 维度 | `main.py` | 1024（与 Pinecone 索引一致） |
-| 检索 k / 重排 top_n | `main.py` | 10 / 3 |
-| Ensemble 权重 | `main.py` | 向量 0.6 : BM25 0.4 |
-| `MAX_MESSAGES` | `main.py` | 20（传给 LLM 的历史上限） |
-| `PROCESS_VERSION` | `main.py` | "v1"（切分逻辑改动 +1 使缓存失效） |
-| `is_import_enabled` | `main.py` | False（是否写向量库） |
+| `RAG_MIN_SCORE` | `config.py` | 0.6（低于此值走联网） |
+| `MAX_ATTEMPTS` | `config.py` | 3（Self-RAG 重试上限） |
+| `ENABLE_REWRITE` | `config.py` | True（语义漂移开关） |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | `config.py` | 500 / 80 |
+| `EMBEDDING_DIMENSION` | `config.py` | 1024（与 Pinecone 索引一致） |
+| `RETRIEVAL_K` / `RERANK_TOP_N` | `config.py` | 10 / 3 |
+| `ENSEMBLE_WEIGHTS` | `config.py` | 向量 0.6 : BM25 0.4 |
+| `MAX_MESSAGES` | `config.py` | 20（传给 LLM 的历史上限） |
+| `PROCESS_VERSION` | `config.py` | "v1"（切分逻辑改动 +1 使缓存失效） |
+| `IS_IMPORT_ENABLED` | `config.py` | False（是否写向量库） |
 
 ---

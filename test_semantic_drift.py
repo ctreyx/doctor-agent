@@ -263,7 +263,7 @@ def run_graph_cases(tag: str) -> int:
 
 def test_with_rewrite():
     """开 rewrite：语义漂移被解决 → 应全绿（通过）。"""
-    app.ENABLE_REWRITE = True
+    app.config.ENABLE_REWRITE = True
     failed = run_graph_cases("rewrite-on")
     print(f"\n【开 rewrite】图内消解成功率：{len(DRIFT_CASES) - failed}/{len(DRIFT_CASES)}")
     assert failed == 0, f"❌ 开 rewrite 仍有 {failed} 条漂移未解决"
@@ -271,7 +271,7 @@ def test_with_rewrite():
 
 def test_without_rewrite():
     """关 rewrite：语义漂移复现 → 应全红（失败，证明漂移存在）。"""
-    app.ENABLE_REWRITE = False
+    app.config.ENABLE_REWRITE = False
     failed = run_graph_cases("rewrite-off")
     print(f"\n【关 rewrite】图内消解成功率：{len(DRIFT_CASES) - failed}/{len(DRIFT_CASES)}")
     assert failed == 0, f"❌ 关 rewrite 后 {failed} 条漂移未解决"   # ← 这行会失败，这正是你要的「红」
@@ -284,7 +284,7 @@ if __name__ == "__main__":
 
 
 
-    print("===== 对照实验 1：开 rewrite（预期全绿）=====")
-    test_with_rewrite()
-    # print("\n===== 对照实验 2：关 rewrite（预期全红）=====")
-    # test_without_rewrite()
+    # print("===== 对照实验 1：开 rewrite（预期全绿）=====")
+    # test_with_rewrite()
+    print("\n===== 对照实验 2：关 rewrite（预期全红）=====")
+    test_without_rewrite()

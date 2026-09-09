@@ -47,3 +47,9 @@ class State(TypedDict):
 
     query: str
     """改写后的完整查询（消除多轮追问的指代漂移，供检索节点使用）。"""
+
+    hyde_done: bool
+    """是否已执行过 HyDE（防死循环，最多执行一次）。"""
+
+    hyde_answer: str
+    """HyDE 生成的假设答案（用于二次检索 + 可观测性追踪）。"""

@@ -242,3 +242,14 @@ def main():
 
 if __name__ == "__main__":   # 直接运行这个文件时才执行 main()；被 import 时不执行
     main()
+
+
+
+
+# | 指标低 | 阈值参考 | 可能原因 | 优化方向 |
+# | :--- | :--- | :--- | :--- |
+# | **Context Recall** | < 0.75 | top_k 太小；chunk 太大；embedding 召回差 | 加大 top_k；缩小 chunk_size；换更强 embedding |
+# | **Context Precision** | < 0.65 | 检索结果含大量无关片段 | 加 Reranker；提高相似度阈值；改善文档质量 |
+# | **Answer Relevancy** | < 0.80 | Prompt 没有引导模型直接回答；答案太长绕弯 | Query 重写；优化 response prompt |
+# | **Faithfulness** | < 0.75 | System prompt 约束弱；检索内容不足 | 强化 system prompt；先提高 Recall |
+

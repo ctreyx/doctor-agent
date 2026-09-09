@@ -23,6 +23,8 @@ from doctor_agent.nodes.retrieve import retrieve_node, route
 from doctor_agent.nodes.rewrite import rewrite_query_node
 from doctor_agent.nodes.web_search import web_search_node
 from doctor_agent.state import State
+from doctor_agent.nodes.hyde import hyde_node   # 新增 import
+
 
 
 def build_graph():
@@ -48,13 +50,16 @@ def build_graph():
     )
     builder.add_edge("blocked", END)          # 越权：直接结束，不走检索/生成
     builder.add_edge("rewrite", "retrieve")   # 改写后进检索
+    builder.add_node("hyde", hyde_node)             # HyDE 假设答案二次检索
 
     builder.add_conditional_edges(
         "retrieve",
         route,
-        {"generate": "generate", "web_search": "web_search"},
+        {"generate": "generate", "web_search": "web_search", "hyde": "hyde"},
     )
     builder.add_edge("web_search", "generate")
+    builder.add_edge("hyde", "retrieve")            # 假设答案 → 再检索
+
 
     # 生成后校验循环
     builder.add_edge("generate", "grade")

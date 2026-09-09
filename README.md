@@ -3,11 +3,11 @@
 # doctor-agent —— 医疗问答 RAG + Agent
 
 一个**生产级**的医疗问答 Agent：基于 **LangGraph** 编排的 RAG 流水线，融合了
-混合检索、交叉编码重排、Self-RAG 自校验、越权拦截、多轮查询改写（消除语义漂移）等企业级能力，
-并通过 **RAGAS** 做量化评测、用 **LLM 生成分析报告**。
+混合检索、交叉编码重排、HyDE 假设答案二次检索、Self-RAG 自校验、越权拦截、
+多轮查询改写（消除语义漂移）等企业级能力，并通过 **RAGAS** 做量化评测、用 **LLM 生成分析报告**。
 
-> 一句话：用户提问 → 越权拦截 → 查询改写 → 混合检索/联网兜底 → 生成答案 → 自校验（不合格则重写），
-> 全程可测试、可评测、可观测。
+> 一句话：用户提问 → 越权拦截 → 查询改写 → 混合检索（低分走 HyDE 二次检索 / 联网兜底）
+> → 生成答案 → 自校验（不合格则重写），全程可测试、可评测、可观测。
 
 
 ---
@@ -18,7 +18,8 @@
 |---|---|
 | 混合检索 | Pinecone 向量检索 + BM25 关键词检索（`EnsembleRetriever`，权重 0.6/0.4） |
 | 交叉编码重排 | `CrossEncoder(ms-marco-MiniLM-L-6-v2)` + Sigmoid 激活，把 logits 映射到 0~1 概率分 |
-| 确定性路由 | rerank top1 分数 ≥ `RAG_MIN_SCORE`(0.6) 走本地 RAG，否则 Tavily 联网兜底 |
+| 确定性路由 | rerank top1 分数 ≥ `RAG_MIN_SCORE`(0.6) 走本地 RAG；低分先 HyDE 二次检索，仍低分才 Tavily 联网兜底 |
+| HyDE 检索增强 | 低分时让 LLM 生成「假设答案」再检索，拉近查询与文档的语义距离；`hyde_done` 防死循环，生成失败 fail-open 回退联网 |
 | Self-RAG 自校验 | 两个 grader：**幻觉校验**（答案是否基于检索事实）+ **答题校验**（是否解决用户问题），不合格带反馈重生成（最多 3 轮） |
 | 越权守卫（Guard） | 在检索前拦截 6 类越权请求（开处方、伪造证明、自伤倾向、非医疗、色情暴力等） |
 | 查询改写（Rewrite） | 多轮追问时把残句（"那会持续多久？"）改写成独立完整查询，消除**语义漂移** |
@@ -62,6 +63,7 @@ doctor-agent/
 │   │   ├── guard.py           #   越权守卫
 │   │   ├── rewrite.py         #   查询改写（语义漂移）
 │   │   ├── retrieve.py        #   检索 + 路由
+│   │   ├── hyde.py            #   HyDE 假设答案二次检索
 │   │   ├── web_search.py      #   联网兜底
 │   │   ├── generate.py        #   生成
 │   │   └── grade.py           #   Self-RAG 校验
@@ -93,7 +95,9 @@ flowchart TD
     G -->|正常| R[rewrite<br/>查询改写/消除指代]
     R --> RET[retrieve<br/>混合检索 + rerank]
     RET -->|score ≥ 0.6| GEN[generate<br/>注入参考资料生成]
-    RET -->|score < 0.6| WEB[web_search<br/>Tavily 联网兜底]
+    RET -->|score < 0.6 且未 HyDE| HYDE[hyde<br/>LLM 生成假设答案]
+    HYDE --> RET
+    RET -->|score < 0.6 且已 HyDE| WEB[web_search<br/>Tavily 联网兜底]
     WEB --> GEN
     GEN --> GRD[grade<br/>Self-RAG 双校验]
     GRD -->|通过 或 达3次上限| END2((END))
@@ -102,6 +106,7 @@ flowchart TD
 ```
 
 > `rewrite` 节点可用开关 `config.ENABLE_REWRITE` 跳过（用于对照实验复现语义漂移）。
+> HyDE 通过 `state.hyde_done` 保证最多执行一次（防死循环）；开关 `config.HYDE_ENABLED`。
 
 ---
 
@@ -121,6 +126,8 @@ flowchart TD
 | `blocked` | `bool` | 是否被越权守卫拦截 |
 | `block_reply` | `str` | 拦截时的合规回复话术 |
 | `query` | `str` | 改写后的查询（解决语义漂移） |
+| `hyde_done` | `bool` | 是否已执行过 HyDE（防死循环，最多一次） |
+| `hyde_answer` | `str` | HyDE 生成的假设答案（用于二次检索） |
 
 ---
 
@@ -131,7 +138,7 @@ flowchart TD
 | 模块 | 职责 | 关键内容 |
 |---|---|---|
 | `config.py` | 全局配置中心 | 所有路径、阈值、模型名、开关常量（唯一修改入口） |
-| `state.py` | 图状态定义 | `State(TypedDict)`，10 个字段 |
+| `state.py` | 图状态定义 | `State(TypedDict)`，12 个字段 |
 | `document_loader.py` | 数据层 | `clean_text` / `load_csv_documents` / `get_documents`（惰性单例 + 磁盘缓存） |
 | `embeddings.py` | Embedding | `DashScopeTextEmbeddingV3` + `get_embeddings`（惰性单例） |
 | `vector_store.py` | 向量库 | `get_index`（惰性连接）/ `upsert_documents`（增量写入） |
@@ -139,7 +146,7 @@ flowchart TD
 | `llm.py` | 模型工厂 | `get_llm`（生成）/ `get_grader_llm`（低温校验） |
 | `prompts.py` | 提示词 | `SYSTEM_PROMPT` + 改写 / 守卫 / 校验模板 |
 | `tools.py` | 工具 | `search_medical_knowledge` / `tavily_tool` / `latest_user_query` |
-| `nodes/` | 图节点 | guard / rewrite / retrieve / web_search / generate / grade |
+| `nodes/` | 图节点 | guard / rewrite / retrieve / hyde / web_search / generate / grade |
 | `graph.py` | 图组装 | `build_graph()` 注册节点并连线 |
 
 各层要点：
@@ -150,6 +157,7 @@ flowchart TD
 - **Self-RAG 校验**：`GradeHallucinations`（防幻觉）+ `GradeAnswer`（防答非所问），低温模型 `temperature=0`；不通过则 `feedback` 注入重生成，上限 `MAX_ATTEMPTS=3`。
 - **越权守卫**：`GuardResult`（is_blocked/reason/reply）拦截 6 类越权请求，被拦截走 `blocked_node` 返回温和拒绝话术。
 - **查询改写**：`rewrite_query_node` 把追问残句改写成完整查询；开关 `config.ENABLE_REWRITE`（True 走 rewrite，False 跳过复现漂移）。
+- **HyDE 检索增强**：检索分数低于 `RAG_MIN_SCORE` 时，`hyde_node` 让 LLM 生成假设答案并覆盖 `query` 二次检索；`hyde_done` 标志保证最多一次，生成失败/为空时 fail-open 回退联网。
 
 ---
 
@@ -186,6 +194,9 @@ uv sync
 
 # RAGAS 评测（抽 5 条样本，固定随机种子）
 & ".\.venv\Scripts\python.exe" evaluate.py --n 5 --seed 42
+
+# HyDE 检索增强测试（强制走 hyde：临时把阈值提到 2.0，观察 [hyde] 日志与 hyde_answer）
+& ".\.venv\Scripts\python.exe" -c "import doctor_agent.config as cfg; cfg.RAG_MIN_SCORE=2.0; import main as app; r=app.graph.invoke({'messages':[{'role':'user','content':'肺癌术后如何护理'}]}, config={'configurable':{'thread_id':'hyde-1'}}); print('=== hyde_answer ==='); print(r.get('hyde_answer','(未触发)')[:120]); print('=== score ===', r.get('score'))"
 ```
 
 ### 3. 启动 LangGraph Server
@@ -224,6 +235,7 @@ uv sync
 | `RAG_MIN_SCORE` | `config.py` | 0.6（低于此值走联网） |
 | `MAX_ATTEMPTS` | `config.py` | 3（Self-RAG 重试上限） |
 | `ENABLE_REWRITE` | `config.py` | True（语义漂移开关） |
+| `HYDE_ENABLED` | `config.py` | True（低分 HyDE 二次检索开关） |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `config.py` | 500 / 80 |
 | `EMBEDDING_DIMENSION` | `config.py` | 1024（与 Pinecone 索引一致） |
 | `RETRIEVAL_K` / `RERANK_TOP_N` | `config.py` | 10 / 3 |

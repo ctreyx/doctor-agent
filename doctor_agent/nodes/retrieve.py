@@ -27,6 +27,21 @@ def retrieve_node(state: State) -> dict:
     }
 
 
+# def route(state: State) -> str:
+#     """条件边：分数达标 → 直接生成；否则 → 联网。"""
+#     return "generate" if state.get("score", 0.0) >= config.RAG_MIN_SCORE else "web_search"
+
+
 def route(state: State) -> str:
-    """条件边：分数达标 → 直接生成；否则 → 联网。"""
-    return "generate" if state.get("score", 0.0) >= config.RAG_MIN_SCORE else "web_search"
+    """条件边：分数达标 → 生成；分数低 → HyDE 二次检索；仍低 → 联网。
+
+    决策顺序（HyDE 最多执行一次，避免死循环）：
+        1. score ≥ RAG_MIN_SCORE            → generate
+        2. score < RAG_MIN_SCORE 且未 HyDE → hyde（用假设答案再检索）
+        3. score < RAG_MIN_SCORE 且已 HyDE → web_search
+    """
+    if state.get("score", 0.0) >= config.RAG_MIN_SCORE:
+        return "generate"
+    if config.HYDE_ENABLED and not state.get("hyde_done", False):
+        return "hyde"
+    return "web_search"

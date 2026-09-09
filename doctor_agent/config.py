@@ -57,3 +57,7 @@ PROCESS_VERSION = "v1"  # 清洗/切分逻辑每次变更 +1，使旧缓存自�
 # ============ 运行时开关 ============
 ENABLE_REWRITE = True       # 语义漂移开关：True=走 rewrite（修复漂移）；False=跳过（复现漂移）
 IS_IMPORT_ENABLED = False   # 是否将文档写入向量库（首次建库时置 True）
+
+
+# ============ HyDE 检索增强 ============
+HYDE_ENABLED = True   # 检索分数低时是否启用 HyDE 假设答案二次检索

@@ -296,6 +296,7 @@ uv sync
 
 # 检索缓存企业级测试套件（12 用例 + 缓存开关对照 + 风险探针，自动生成 md 报告）
 & ".\.venv\Scripts\python.exe" cache_test_suite.py --cache-mode both
+例子： 感冒需要吃什么药  和 感冒应该吃什么药
 ```
 
 ### 3. 启动 LangGraph Server

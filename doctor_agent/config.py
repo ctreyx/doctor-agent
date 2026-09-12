@@ -61,3 +61,14 @@ IS_IMPORT_ENABLED = False   # 是否将文档写入向量库（首次建库时�
 
 # ============ HyDE 检索增强 ============
 HYDE_ENABLED = True   # 检索分数低时是否启用 HyDE 假设答案二次检索
+
+
+# ============ RAG 检索结果缓存 ============
+RAG_CACHE_ENABLED = True      # 高频问题检索结果缓存开关
+RAG_CACHE_MAX_SIZE = 256      # 内存容量上限（LRU 淘汰）
+RAG_CACHE_TTL = 24 * 3600     # 有效期（秒），医疗知识稳定可设长
+
+
+
+RAG_CACHE_EMBED_MODEL = "BAAI/bge-small-zh-v1.5"  # 本地轻量中文 embedding（语义 key）
+RAG_CACHE_SEMANTIC_THRESHOLD = 0.92               # 语义匹配余弦阈值（医疗场景宁缺毋滥）

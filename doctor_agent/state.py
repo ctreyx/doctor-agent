@@ -53,3 +53,12 @@ class State(TypedDict):
 
     hyde_answer: str
     """HyDE 生成的假设答案（用于二次检索 + 可观测性追踪）。"""
+
+    cache_hit: bool
+    """本次检索是否命中缓存（True = 命中并跳过整套检索）。"""
+
+    cache_reason: str
+    """缓存命中原因：exact（精确）/ semantic（语义）/ miss（未命中）/ bypass_hyde（HyDE 路径跳过）/ cache_disabled（缓存关闭）。"""
+
+    cache_mode: str
+    """缓存开关状态：on / off（供链路追踪对照）。"""

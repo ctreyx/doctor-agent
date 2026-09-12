@@ -12,6 +12,7 @@ from pinecone import Pinecone, ServerlessSpec
 from doctor_agent import config
 from doctor_agent.document_loader import doc_hash, load_manifest, save_manifest
 from doctor_agent.embeddings import get_embeddings
+from doctor_agent.retrieval_cache import invalidate_cache
 
 _pc: Pinecone | None = None
 _index = None
@@ -77,5 +78,8 @@ def upsert_documents(docs, batch_size: int = 100) -> int:
         for i, _, h in batch:
             manifest[i] = h
         save_manifest(manifest)   # 每批落盘，断点续跑
+
+    # 缓存
+    invalidate_cache()
 
     return len(to_upsert)

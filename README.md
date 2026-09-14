@@ -24,6 +24,8 @@
 | Self-RAG 自校验 | 两个 grader：**幻觉校验**（答案是否基于检索事实）+ **答题校验**（是否解决用户问题），不合格带反馈重生成（最多 3 轮） |
 | 越权守卫（Guard） | 在检索前拦截 6 类越权请求（开处方、伪造证明、自伤倾向、非医疗、色情暴力等） |
 | 查询改写（Rewrite） | 多轮追问时把残句（"那会持续多久？"）改写成独立完整查询，消除**语义漂移** |
+| HTTP API（FastAPI） | 提供 `/api/v1/chat` 接口，支持多轮会话（`thread_id` 记忆）与 Bearer Token 鉴权 |
+| 登录鉴权 | 账号密码登录换取 token；受保护接口校验 `Authorization: Bearer <token>`，比较用 `secrets.compare_digest` 防时序攻击 |
 | RAGAS 评测 | 5 指标量化质量 + LLM 自动生成可交付的分析报告 |
 
 ---
@@ -41,6 +43,7 @@
 | 重排 | `sentence-transformers` CrossEncoder |
 | 本地语义 Embedding | `sentence-transformers` `bge-small-zh-v1.5`（缓存语义匹配 key，毫秒级、无网络） |
 | 联网搜索 | Tavily Search |
+| 接口层 | FastAPI + Uvicorn（REST API、Bearer Token 鉴权、多轮会话） |
 | 评测 | RAGAS 0.2.12（5 指标 + LLM 分析报告） |
 
 ---
@@ -71,10 +74,23 @@ doctor-agent/
 │   │   ├── generate.py        #   生成
 │   │   └── grade.py           #   Self-RAG 校验
 │   └── graph.py               # 图组装（build_graph）
+├── api/                       # HTTP 接口层（FastAPI）
+│   ├── app.py                 #   应用入口（加载 .env → 注册路由）
+│   ├── schemas.py             #   请求/响应模型（Pydantic）
+│   ├── deps.py                #   依赖注入（Bearer Token 校验）
+│   ├── graph_instance.py      #   带 checkpointer 的图实例（多轮记忆）
+│   ├── routers/
+│   │   ├── auth.py            #   登录（/auth/login）
+│   │   └── chat.py            #   对话（/chat）
+│   └── services/
+│       └── agent.py           #   封装 graph 调用（唯一与图交互处）
 ├── evaluate.py                # RAGAS 评测脚本（抽样本 → 检索生成 → 打分 → LLM 报告）
 ├── guard_eval.py              # 越权拦截测试（7 条用例，含 5 越权 + 2 正常对照）
 ├── test_semantic_drift.py     # 语义漂移对照实验（追问用例，开/关 rewrite 对比）
 ├── cache_test_suite.py        # 检索缓存企业级测试套件（12 用例 + 开关对照 + 风险探针，生成 md 报告）
+├── api_smoke_test.py          # API 冒烟测试（验证多轮记忆是否生效）
+├── auth_smoke_test.py         # 鉴权冒烟测试（401 / 登录发 token / 带 token 200）
+├── retrieval_hit_rate_test.py # 查询改写对检索命中率的对照实验（实体命中率）
 ├── datas/
 │   └── zhongliu.csv           # 肿瘤科问答数据（GB18030 编码，4 列）
 ├── prompts/
@@ -252,7 +268,51 @@ flowchart LR
 
 ---
 
-## 八、运行方式
+## 八、HTTP API（FastAPI）
+
+除 LangGraph Server 外，项目还提供独立的 REST 接口层（`api/`），供前端调用。
+
+### 1. 接口一览
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/health` | 否 | 健康检查 |
+| POST | `/api/v1/auth/login` | 否 | 登录，返回 access token |
+| POST | `/api/v1/chat` | ✅ Bearer | 对话（支持多轮记忆） |
+
+### 2. 登录鉴权
+
+账号密码校验通过后返回 token，受保护接口需带请求头 `Authorization: Bearer <token>`。
+
+- 默认账号：`admin` / `admin@123`（见 `config.AUTH_USERNAME` / `AUTH_PASSWORD`）
+- Token：`config.AUTH_TOKEN`（当前为演示用固定值，**生产应换 JWT**）
+- 安全细节：凭据与 token 比较用 `secrets.compare_digest`（常量时间），避免时序攻击
+
+### 3. 多轮对话记忆
+
+多轮记忆 = **checkpointer + `thread_id`**：
+
+- `api/graph_instance.py` 用 `SqliteSaver` 编译带持久化的图（与 LangGraph Server 的图分开，避免两套 checkpointer 冲突）
+- 请求体传同一个 `thread_id` → LangGraph 自动加载历史 → `rewrite` 节点可做指代消解
+
+```json
+{ "message": "那会持续多久？", "thread_id": "t1" }
+```
+
+> 响应里的 `query` 字段是**改写后的检索查询**，可用来验证记忆是否生效：
+> 第 2 轮追问 `那会持续多久？` → `query` 应变成 `化疗后恶心会持续多久？`
+
+### 4. 注意事项
+
+| 项 | 说明 |
+|---|---|
+| 必须先加载 `.env` | `api/app.py` 顶部 `load_dotenv()` 必须在导入 `doctor_agent` 前执行（`tools.py` 导入时就要用 `TAVILY_API_KEY`） |
+| state 必须可序列化 | checkpointer 用 msgpack 序列化 state，**numpy 类型会报错**；`rerank_documents` 已把分数转为 Python `float` |
+| 单 worker | SQLite checkpointer 与内存缓存都不支持多进程共享，多实例需换 Postgres + Redis |
+
+---
+
+## 九、运行方式
 
 ### 1. 环境准备
 
@@ -296,7 +356,6 @@ uv sync
 
 # 检索缓存企业级测试套件（12 用例 + 缓存开关对照 + 风险探针，自动生成 md 报告）
 & ".\.venv\Scripts\python.exe" cache_test_suite.py --cache-mode both
-例子： 感冒需要吃什么药  和 感冒应该吃什么药
 ```
 
 ### 3. 启动 LangGraph Server
@@ -307,9 +366,21 @@ uv sync
 
 入口由 `langgraph.json` 指定为 `./main.py:graph`。
 
+### 4. 启动 HTTP API（FastAPI）
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m uvicorn api.app:app --port 8001 --reload
+```
+
+- 交互式文档：http://127.0.0.1:8001/docs
+- 建议加 `--reload`（改后端代码自动重载，避免「改了代码但服务仍跑旧逻辑」）
+- 冒烟测试（需服务已启动）：
+  - `& ".\.venv\Scripts\python.exe" api_smoke_test.py` —— 多轮记忆
+  - `& ".\.venv\Scripts\python.exe" auth_smoke_test.py` —— 登录鉴权
+
 ---
 
-## 九、评测（RAGAS）
+## 十、评测（RAGAS）
 
 `evaluate.py` 做五维量化评测：
 
@@ -328,7 +399,7 @@ uv sync
 
 ---
 
-## 十、关键参数速查
+## 十一、关键参数速查
 
 | 参数 | 位置 | 值 |
 |---|---|---|
@@ -352,5 +423,8 @@ uv sync
 | `MAX_MESSAGES` | `config.py` | 20（传给 LLM 的历史上限） |
 | `PROCESS_VERSION` | `config.py` | "v1"（切分逻辑改动 +1 使缓存失效） |
 | `IS_IMPORT_ENABLED` | `config.py` | False（是否写向量库） |
+| `AUTH_USERNAME` | `config.py` | `admin`（登录账号） |
+| `AUTH_PASSWORD` | `config.py` | `admin@123`（登录密码） |
+| `AUTH_TOKEN` | `config.py` | 固定假 token（演示用；生产应换 JWT） |
 
 ---

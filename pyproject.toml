@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "dashscope>=1.27.3",
+    "fastapi>=0.141.1",
     "langchain>=1.4.0",
     "langchain-classic>=1.0.8",
     "langchain-community>=0.4.2",
@@ -22,11 +23,16 @@ dependencies = [
     "sentence-transformers>=6.0.1",
     "tiktoken>=0.8.0",
     "torch>=2.14.0",
+    "uvicorn[standard]>=0.52.4",
 ]
 
 [build-system]
 requires = ["uv_build>=0.12.6,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""              # flat 布局：包位于项目根目录，而非 src/
+module-name = "doctor_agent"
 
 [dependency-groups]
 dev = [

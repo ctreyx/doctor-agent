@@ -72,3 +72,9 @@ RAG_CACHE_TTL = 24 * 3600     # 有效期（秒），医疗知识稳定可设长
 
 RAG_CACHE_EMBED_MODEL = "BAAI/bge-small-zh-v1.5"  # 本地轻量中文 embedding（语义 key）
 RAG_CACHE_SEMANTIC_THRESHOLD = 0.92               # 语义匹配余弦阈值（医疗场景宁缺毋滥）
+
+
+# ============ 登录鉴权 ============
+AUTH_USERNAME = "admin"
+AUTH_PASSWORD = "admin@123"
+AUTH_TOKEN = "fake-token-doctor-agent-2026"   # 写死的假 token（仅演示登录流程）

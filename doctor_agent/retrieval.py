@@ -58,7 +58,9 @@ def rerank_documents(query: str, docs: list[Document], top_n: int = config.RERAN
     pairs = [(query, doc.page_content) for doc in docs]
     scores = reranker.predict(pairs)
     ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
-    return ranked[:top_n]
+    # 转 Python float：CrossEncoder 返回 numpy.float32，
+    # 而 checkpointer 用 msgpack 序列化 state 时不支持 numpy 类型（会 500）。
+    return [(float(s), d) for s, d in ranked[:top_n]]
 
 
 def format_context(docs: list[Document]) -> str:

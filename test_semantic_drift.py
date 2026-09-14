@@ -284,7 +284,7 @@ if __name__ == "__main__":
 
 
 
-    # print("===== 对照实验 1：开 rewrite（预期全绿）=====")
-    # test_with_rewrite()
+    print("===== 对照实验 1：开 rewrite（预期全绿）=====")
+    test_with_rewrite()
     print("\n===== 对照实验 2：关 rewrite（预期全红）=====")
     test_without_rewrite()

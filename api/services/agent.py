@@ -1,18 +1,20 @@
 """Agent 服务层：封装 LangGraph 图调用。"""
 from uuid import uuid4
 
-from api.graph_instance import graph
+from api.graph_instance import get_graph
 
 
-def ask(message: str, thread_id: str | None = None) -> dict:
-    """跑一轮对话。
+async def ask(message: str, thread_id: str | None = None) -> dict:
+    """跑一轮对话（异步）。
 
     记忆要点：
         - thread_id 相同 → LangGraph 自动加载历史（多轮上下文）
         - 不传/新 id     → 全新会话
+
+    注意：checkpointer 是 AsyncSqliteSaver，必须用 ainvoke（不能 invoke）。
     """
     tid = thread_id or str(uuid4())
-    result = graph.invoke(
+    result = await get_graph().ainvoke(
         {"messages": [{"role": "user", "content": message}]},
         config={"configurable": {"thread_id": tid}},   # ← 记忆靠这一行
     )

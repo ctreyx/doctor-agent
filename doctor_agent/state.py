@@ -62,3 +62,13 @@ class State(TypedDict):
 
     cache_mode: str
     """缓存开关状态：on / off（供链路追踪对照）。"""
+
+
+    resume: bool
+    """True = 本次是续写请求（START 直接进 generate，跳过 guard/rewrite/retrieve）。"""
+
+    truncated: bool
+    """上一轮生成是否因 max_tokens 被截断（落库，供续写前置校验）。"""
+
+    continue_count: int
+    """本轮回答已续写次数（服务端防刷 + 控成本）。"""

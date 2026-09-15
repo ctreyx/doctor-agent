@@ -28,6 +28,24 @@ from doctor_agent.nodes.web_search import web_search_node
 from doctor_agent.state import State
 
 
+
+def route_entry(state: State) -> str:
+    """起点条件边：续写走 generate 捷径，正常问题走 guard。
+
+    续写能跳过检索，靠的是 checkpointer 已把上一轮的 ``context`` / ``query`` /
+    ``score`` 恢复进 state，generate 直接读即可，重新检索纯属浪费。
+    """
+    return "generate" if state.get("resume") else "guard"
+
+
+def route_after_generate(state: State) -> str:
+    """生成后条件边：续写不再跑 Self-RAG 校验。
+
+    续写内容是上一轮的延续，跑校验会触发 ``feedback → generate`` 重生成，
+    把整段回答重写一遍，续写就白做了。
+    """
+    return "end" if state.get("resume") else "grade"
+
 def build_graph(checkpointer=None):                    # ← 1
     """组装并编译医疗问答 Agent 图。"""
     builder = StateGraph(State)
@@ -44,7 +62,11 @@ def build_graph(checkpointer=None):                    # ← 1
     builder.add_node("feedback", feedback_node)      # 反馈注入
 
     # ---- 连线 ----
-    builder.add_edge(START, "guard")
+    builder.add_conditional_edges(
+        START,
+        route_entry,
+        {"guard": "guard", "generate": "generate"},   #  续写直连 generate
+    )
     builder.add_conditional_edges(
         "guard",
         route_after_guard,
@@ -62,7 +84,11 @@ def build_graph(checkpointer=None):                    # ← 1
     builder.add_edge("hyde", "retrieve")      # 假设答案 → 再检索
 
     # 生成后校验循环
-    builder.add_edge("generate", "grade")
+    builder.add_conditional_edges(
+        "generate",
+        route_after_generate,
+        {"grade": "grade", "end": END},               # ★ 续写生成完直接结束
+    )
     builder.add_conditional_edges(
         "grade",
         route_after_grade,

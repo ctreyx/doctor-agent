@@ -13,13 +13,27 @@ from dotenv import load_dotenv
 # 若环境变量未就绪，导入阶段即报错（与 main.py 的 load_dotenv 同理）。
 load_dotenv()
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
-from api.routers import auth, chat            # ← 加在顶部 import 区
+
+from api import graph_instance
+from api.routers import auth, chat
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动时初始化图（异步 checkpointer），关闭时释放连接。"""
+    await graph_instance.startup()
+    yield
+    await graph_instance.shutdown()
+
 
 app = FastAPI(
     title="doctor-agent API",
     version="0.1.0",
     description="医疗问答 RAG Agent 的 HTTP 接口层",
+    lifespan=lifespan,
 )
 
 

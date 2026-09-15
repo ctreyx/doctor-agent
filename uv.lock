@@ -571,6 +571,7 @@ name = "doctor-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiosqlite" },
     { name = "dashscope" },
     { name = "fastapi" },
     { name = "langchain" },
@@ -599,6 +600,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiosqlite", specifier = ">=0.22.1" },
     { name = "dashscope", specifier = ">=1.27.3" },
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "langchain", specifier = ">=1.4.0" },

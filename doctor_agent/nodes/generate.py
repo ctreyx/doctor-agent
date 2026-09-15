@@ -16,7 +16,11 @@ def generate_node(state: State) -> dict:
     context = state.get("context") or "当前暂无相关参考资料。"
     sys_msg = SystemMessage(content=SYSTEM_PROMPT + "\n\n【参考资料】\n" + context)
     resp = get_llm().invoke([sys_msg] + state["messages"][-config.MAX_MESSAGES:])
+
+
+    finish = (resp.response_metadata or {}).get("finish_reason")
     return {
         "messages": [resp],
-        "generation": resp.content,   # 写回 state，供校验节点与测试读取
+        "generation": resp.content,   # 写回 state， Self-RAG 校验节点读取
+        "truncated": finish == "length",     # ：续写校验的依据
     }

@@ -78,3 +78,14 @@ RAG_CACHE_SEMANTIC_THRESHOLD = 0.92               # 语义匹配余弦阈值（�
 AUTH_USERNAME = "admin"
 AUTH_PASSWORD = "admin@123"
 AUTH_TOKEN = "fake-token-doctor-agent-2026"   # 写死的假 token（仅演示登录流程）
+
+
+
+# ============ 续写（截断后继续生成） ============
+CONTINUE_ENABLED = True          # 续写开关
+CONTINUE_MAX_ROUNDS = 3          # 同一轮回答最多续写次数（防刷 + 控成本）
+CONTINUE_PROMPT = (
+    "上一段回答因长度限制被中断。请从最后一个不完整的句子继续，"
+    "先补完该句，再继续后续内容。"
+    "不要重复已出现过的文字，不要重新开始，不要加任何过渡语。"
+)

@@ -107,9 +107,9 @@ doctor-agent/
 └── ragas_results.csv / ragas_report_*.md  # 评测输出
 ```
 
-> 前端是**独立工程**（不在本目录内），路径 `../doctor-agent-web`：
-> Vue 3 + Vite + TypeScript + SCSS，通过 Vite dev server 代理 `/api` → `http://127.0.0.1:8001`。
-> 其流式消费与续写交互的实现细节见 **第九节**。
+> 前端是**独立仓库**：[ctreyx/doctor-agent-web](https://github.com/ctreyx/doctor-agent-web)
+> （Vue 3 + Vite + TypeScript + SCSS），通过 Vite dev server 代理 `/api` → `http://127.0.0.1:8001`。
+> 本地开发时与本目录平级（`../doctor-agent-web`）；其流式消费与续写交互的实现细节见 **第九节**。
 
 ---
 
@@ -483,7 +483,8 @@ graph_input = {
 
 ### 3. 前端链路
 
-前端独立工程：`../doctor-agent-web`（Vue 3 + Vite + TypeScript，**不在本仓库内**）。
+前端是**独立仓库**：[ctreyx/doctor-agent-web](https://github.com/ctreyx/doctor-agent-web)
+（Vue 3 + Vite + TypeScript；本地开发时与本目录平级，即 `../doctor-agent-web`）。
 
 调用链：`Vite dev server (5173)` → `proxy /api` → `FastAPI (8001)`。
 
@@ -804,3 +805,29 @@ uv sync
 | `CONTINUE_PROMPT` | `config.py` | 续写指令（要求先补完被切断的句子、不重复、不加过渡语） |
 
 ---
+
+## 十三、相关仓库
+
+| 仓库 | 说明 |
+|---|---|
+| `ctreyx/doctor-agent` | 本仓库：LangGraph RAG Agent + FastAPI 后端 |
+| [ctreyx/doctor-agent-web](https://github.com/ctreyx/doctor-agent-web) | 前端：Vue 3 + Vite + TypeScript 对话界面（流式消费、截断续写、Markdown 渲染） |
+
+### 接口契约对照
+
+前后端约定由本仓库的 `api/schemas.py` / `api/routers/chat.py` ↔ 前端 `src/api.ts` 对齐：
+
+| 契约 | 后端 | 前端 |
+|---|---|---|
+| 续写开关 | `ChatRequest.resume` | `StreamOptions.resume` → 请求体 `resume` |
+| 续写次数上限 | `config.CONTINUE_MAX_ROUNDS` | `App.vue` 的 `CONTINUE_MAX_ROUNDS` |
+| 截断事件 | `chat.py` 的 `_sse(..., event="max_length")` | `api.ts` 解析 `event: max_length` |
+| 结束事件字段 | `done` 事件 payload | `StreamInfo` 接口 |
+
+> ⚠️ 改契约时三处要同步：后端 `schemas.py`、前端 `api.ts`、双端的 `CONTINUE_MAX_ROUNDS`。
+
+---
+
+## 十四、License
+
+[MIT](./LICENSE) © 2026 ctrey

@@ -25,6 +25,8 @@
 | 越权守卫（Guard） | 在检索前拦截 6 类越权请求（开处方、伪造证明、自伤倾向、非医疗、色情暴力等） |
 | 查询改写（Rewrite） | 多轮追问时把残句（"那会持续多久？"）改写成独立完整查询，消除**语义漂移** |
 | HTTP API（FastAPI） | 提供 `/api/v1/chat` 接口，支持多轮会话（`thread_id` 记忆）与 Bearer Token 鉴权 |
+| 流式对话（SSE） | `/api/v1/chat/stream` 逐 token 推送；前端用 rAF 批量渲染，首字延迟 / 渲染帧数可观测 |
+| 截断续写 | 检测 `finish_reason == "length"` 推 `event: max_length`；前端「继续生成」复用同一 `thread_id`，后端从 checkpoint 取回上一轮检索结果、直连 `generate`（跳过 guard/rewrite/retrieve/grade） |
 | 登录鉴权 | 账号密码登录换取 token；受保护接口校验 `Authorization: Bearer <token>`，比较用 `secrets.compare_digest` 防时序攻击 |
 | RAGAS 评测 | 5 指标量化质量 + LLM 自动生成可交付的分析报告 |
 
@@ -78,10 +80,10 @@ doctor-agent/
 │   ├── app.py                 #   应用入口（加载 .env → 注册路由）
 │   ├── schemas.py             #   请求/响应模型（Pydantic）
 │   ├── deps.py                #   依赖注入（Bearer Token 校验）
-│   ├── graph_instance.py      #   带 checkpointer 的图实例（多轮记忆）
+│   ├── graph_instance.py      #   带 AsyncSqliteSaver 的图实例（多轮记忆 + 续写的基础）
 │   ├── routers/
 │   │   ├── auth.py            #   登录（/auth/login）
-│   │   └── chat.py            #   对话（/chat）
+│   │   └── chat.py            #   对话（/chat 同步 + /chat/stream 流式 SSE + 续写前置校验）
 │   └── services/
 │       └── agent.py           #   封装 graph 调用（唯一与图交互处）
 ├── evaluate.py                # RAGAS 评测脚本（抽样本 → 检索生成 → 打分 → LLM 报告）
@@ -95,6 +97,8 @@ doctor-agent/
 │   └── zhongliu.csv           # 肿瘤科问答数据（GB18030 编码，4 列）
 ├── prompts/
 │   └── doctor_prompt.md       # 医生角色 system prompt（含安全规则 + 免责声明模板）
+├── resources/
+│   └── api_checkpoint.db      # 会话状态持久化（AsyncSqliteSaver；多轮记忆与续写都靠它）
 ├── pyproject.toml             # 依赖声明（uv）
 ├── langgraph.json             # LangGraph Server 配置（入口 ./main.py:graph）
 ├── cache/                     # 切分缓存（增量失效，避免重复切分）
@@ -102,6 +106,10 @@ doctor-agent/
 ├── reports/                   # 测试报告输出（cache_test_report_*.md）
 └── ragas_results.csv / ragas_report_*.md  # 评测输出
 ```
+
+> 前端是**独立工程**（不在本目录内），路径 `../doctor-agent-web`：
+> Vue 3 + Vite + TypeScript + SCSS，通过 Vite dev server 代理 `/api` → `http://127.0.0.1:8001`。
+> 其流式消费与续写交互的实现细节见 **第九节**。
 
 ---
 
@@ -153,6 +161,9 @@ flowchart TD
 | `cache_hit` | `bool` | 本次检索是否命中缓存（True=命中并跳过整套检索） |
 | `cache_reason` | `str` | 缓存命中原因：exact / semantic / miss / bypass_hyde / cache_disabled |
 | `cache_mode` | `str` | 缓存开关状态：on / off |
+| `resume` | `bool` | 本次是否为续写请求（True → START 直连 `generate`，跳过 guard/rewrite/retrieve/grade） |
+| `truncated` | `bool` | 上一轮生成是否因 `max_tokens` 被截断（由 `generate` 写回并持久化，续写校验的依据） |
+| `continue_count` | `int` | 本轮回答已续写次数（服务端防刷 + 控成本，上限 `CONTINUE_MAX_ROUNDS`） |
 
 ---
 
@@ -278,7 +289,8 @@ flowchart LR
 |---|---|---|---|
 | GET | `/health` | 否 | 健康检查 |
 | POST | `/api/v1/auth/login` | 否 | 登录，返回 access token |
-| POST | `/api/v1/chat` | ✅ Bearer | 对话（支持多轮记忆） |
+| POST | `/api/v1/chat` | ✅ Bearer | 对话（一次性返回完整答案，支持多轮记忆） |
+| POST | `/api/v1/chat/stream` | ✅ Bearer | **流式对话（SSE）**，逐 token 推送，支持截断续写，详见第九节 |
 
 ### 2. 登录鉴权
 
@@ -292,8 +304,9 @@ flowchart LR
 
 多轮记忆 = **checkpointer + `thread_id`**：
 
-- `api/graph_instance.py` 用 `SqliteSaver` 编译带持久化的图（与 LangGraph Server 的图分开，避免两套 checkpointer 冲突）
-- 请求体传同一个 `thread_id` → LangGraph 自动加载历史 → `rewrite` 节点可做指代消解
+- `api/graph_instance.py` 用 `AsyncSqliteSaver` 编译带持久化的图（`astream` 是异步的，同步 `SqliteSaver` 会抛 `NotImplementedError`；与 LangGraph Server 的图分开，避免两套 checkpointer 冲突）
+- 请求体传同一个 `thread_id` → LangGraph 自动加载**上一轮完整 state**（`messages` / `context` / `query` / `score` 全部恢复）→ `rewrite` 节点可做指代消解
+- 这个机制同时是**截断续写**的基础：续写请求复用同一 `thread_id`，后端不做检索即可拿到上一轮的 `context`（详见第九节）
 
 ```json
 { "message": "那会持续多久？", "thread_id": "t1" }
@@ -312,7 +325,366 @@ flowchart LR
 
 ---
 
-## 九、运行方式
+## 九、流式输出与断点续写（截断 → 继续生成）
+
+### 1. 要解决的问题
+
+LLM 单次输出受 `max_tokens` 限制。长回答会被**硬截断**——停在半句话中间，
+但前端看起来像是"答完了"，用户拿不到完整内容。
+
+先把三个容易混淆的概念分清：
+
+| 常见误解 | 实际情况 |
+|---|---|
+| "接口限制了传给前端的 token 数" | ❌ SSE 走 `Transfer-Encoding: chunked`，没有 `Content-Length`，**传输层无任何 token 上限** |
+| "模型已经答完了" | ❌ `finish_reason == "length"` 表示撞到了 `max_tokens` 上限，不是自然结束 |
+| "缓存上次结果，下次直接拉" | ❌ 缓存的是**完整回答**；被截断的回答本身残缺，缓存下来还是残缺的 |
+
+> 补充：`finish_reason` 其他取值 —— `stop`（正常说完）/ `content_filter`（内容安全拦截）/ `tool_calls`（要调工具）。
+
+**业界的分层解法**（由治本到补救）：
+
+| 层 | 做法 | 适用 |
+|---|---|---|
+| L0 | 抬高 `max_tokens`（DeepSeek 上限 8192） | 所有场景，第一优先 |
+| L1 | 流式输出 + 客户端拼接 | 基线 |
+| L2 | **续写（continuation）**——把半截答案留在上下文里让模型接着写 | 交互式对话（本项目） |
+| L3 | 服务端响应持久化 + `response_id` 拉取 | 托管平台（OpenAI Responses API） |
+| L4 | Outline → 分章节生成 | 长报告 / Deep Research 类产品 |
+
+本项目实现 **L2**。其中 L3 在 LangGraph 体系里等价于 **checkpointer + `thread_id`**，
+本项目已经具备，续写正是建立在这个能力之上。
+
+### 2. 后端链路
+
+#### 2.1 SSE 事件协议
+
+`POST /api/v1/chat/stream` 按 SSE 格式推送四类消息：
+
+| 事件名 | payload | 时机 |
+|---|---|---|
+| （默认） | `{"token": "增量文本"}` | 每收到一个 generate 节点的增量 token |
+| `event: max_length` | `{"reason": "length", "chars": 1234}` | 检测到 `finish_reason == "length"` |
+| （默认） | `{"done": true, "thread_id": "...", "query": "...", "cache_hit": false, "cache_reason": "miss", "truncated": true, "continue_count": 0}` | 流正常结束 |
+| （默认） | `{"error": "服务暂时不可用，请稍后重试", "trace_id": "..."}` | 异常收尾 |
+
+> 两个工程细节：
+> - `truncated` 在 `done` 里**冗余带一份**，避免 `max_length` 事件在网络分包边界丢失导致前端漏判
+> - 流一旦开始，HTTP 状态码已经发出，**错误只能以事件形式收尾**；且不回显 `type(e).__name__` 等内部信息，详情只进服务端日志
+
+#### 2.2 请求体
+
+```json
+{ "message": "继续", "thread_id": "web-1", "resume": true }
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `message` | `str` | 1~2000 字符 |
+| `thread_id` | `str \| None` | 不传则新建会话 |
+| `resume` | `bool` | `true` = 续写上一轮被截断的回答 |
+
+#### 2.3 图的双入口
+
+`doctor_agent/graph.py` 为 `START` 增加条件路由，并让 `generate` 的出口分流：
+
+```mermaid
+graph LR
+    START -->|resume=true| generate[generate 生成]
+    START -->|resume=false| guard[guard 越权拦截]
+    guard --> rewrite[rewrite 查询改写] --> retrieve[retrieve 检索+重排]
+    retrieve -->|"score≥0.6"| generate
+    retrieve -->|"低分且未 HyDE"| hyde[hyde 假设答案] --> retrieve
+    retrieve -->|"已 HyDE 仍低分"| web_search[web_search 联网兜底] --> generate
+    generate -->|resume=true| END
+    generate -->|resume=false| grade[grade Self-RAG 校验]
+    grade -->|通过 / 达上限| END
+    grade -->|不通过| feedback[feedback 反馈] --> generate
+```
+
+- `route_entry()`：`state["resume"]` 为真 → 直连 `generate`，否则走 `guard`
+- `route_after_generate()`：续写生成完**直接 END**，不跑 Self-RAG 校验
+  （否则 `grade` 不通过会触发 `feedback → generate` 把整段回答重写一遍，续写就白做了）
+
+#### 2.4 为什么"跳过检索"是成立的
+
+关键在于 **checkpointer 恢复的不只是 `messages`**：
+
+```python
+# 续写请求只传了 messages 和 resume 两个入参
+graph.astream(
+    {"messages": [HumanMessage("继续")], "resume": True, "continue_count": 1},
+    config={"configurable": {"thread_id": "web-1"}},
+)
+```
+
+LangGraph 先按 `thread_id` 从 `resources/api_checkpoint.db` 读出上一轮 state，
+再用 reducer 合并入参。于是 `generate` 节点读到的：
+
+```python
+context = state.get("context")      # ← 上一轮的检索结果，原样还在
+resp = get_llm().invoke([sys_msg] + state["messages"][-config.MAX_MESSAGES:])
+                                # ↑ 包含上一条被截断的 AIMessage
+```
+
+模型看到"自己上一条说到一半" + "用户让我继续"，自然接着写。
+
+**"从哪里开始"不需要任何显式游标——半截答案本身就是上下文。**
+
+同时省掉的调用：
+
+| 节点 | 首次提问 | 续写 |
+|---|---|---|
+| guard（越权判定 LLM） | ✅ | **跳过** |
+| rewrite（查询改写 LLM） | ✅ | **跳过** |
+| retrieve（embedding + BM25 + CrossEncoder 重排） | ✅ | **跳过** |
+| generate（生成 LLM） | ✅ | ✅（唯一保留） |
+| grade + feedback（Self-RAG 校验 LLM） | ✅ | **跳过** |
+| **总 LLM 调用次数** | 4~5 | **1** |
+
+#### 2.5 `truncated` 落库
+
+续写请求的合法性由服务端判定，**不能信客户端**。因此 `generate_node` 必须把截断状态写回 state：
+
+```python
+finish = (resp.response_metadata or {}).get("finish_reason")
+return {
+    "messages": [resp],
+    "generation": resp.content,
+    "truncated": finish == "length",   # ← 由 checkpointer 持久化
+}
+```
+
+> 不落库的话，后端就"不知道"上一轮是否被截断，`aget_state` 拿不到该字段，
+> 所有续写请求都会被 409 拒绝。
+
+#### 2.6 续写前置校验
+
+`api/routers/chat.py` 在建立流之前先读 checkpoint 做四项校验：
+
+| HTTP | 触发条件 | detail |
+|---|---|---|
+| 400 | `resume=true` 但没带 `thread_id` | 续写必须携带 thread_id |
+| 409 | 该 thread 没有 `messages` | 该会话没有可续写的内容 |
+| 409 | 上一轮 `truncated` 不为真 | 上一轮回答未被截断，无需续写 |
+| 429 | `continue_count >= CONTINUE_MAX_ROUNDS` | 本轮最多续写 3 次 |
+
+校验通过后组装入参：
+
+```python
+graph_input = {
+    "messages": [HumanMessage(content=config.CONTINUE_PROMPT)],
+    "resume": True,                    # ← 决定走 generate 捷径
+    "continue_count": done + 1,        # ← 计数落库，供下次校验
+}
+```
+
+`CONTINUE_PROMPT` 专门要求"先补完被切断的那句，不要重复已出现过的文字，不要加过渡语"。
+
+### 3. 前端链路
+
+前端独立工程：`../doctor-agent-web`（Vue 3 + Vite + TypeScript，**不在本仓库内**）。
+
+调用链：`Vite dev server (5173)` → `proxy /api` → `FastAPI (8001)`。
+
+#### 3.1 分层职责
+
+| 文件 | 层 | 职责 |
+|---|---|---|
+| `src/api.ts` | 传输层 | `streamOnce` 单次 SSE 请求 + 解析；`chatStream` 重试包装 |
+| `src/App.vue` | 消费层 | `runStream` 统一流式入口；`continueFrom` 续写触发 |
+
+#### 3.2 `api.ts` —— 事件名解析
+
+SSE 一个 block 可能有多行（`event:` / `data:`），原生 `EventSource` 又不支持 `POST`、
+不能带 `Authorization` 头、不支持 `AbortSignal`，所以用 `fetch` + `ReadableStream` 手写解析：
+
+```ts
+for (const raw of part.split("\n")) {
+  const line = raw.trim();
+  if (line.startsWith("event:")) eventName = line.slice(6).trim();
+  else if (line.startsWith("data:")) dataLine = line.slice(5).trim();
+}
+const obj = JSON.parse(dataLine);
+if (eventName === "max_length") { h.onTruncated?.(obj); continue; }   // ← 独立事件
+if (obj.token !== undefined) h.onToken(obj.token);
+else if (obj.done) { sawDone = true; h.onDone(obj); }
+else if (obj.error) { h.onError(obj.error); return; }
+```
+
+- 解析器按 `\n\n` 切分消息，**最后一段可能不完整，留在 buffer 里等下一轮拼接**
+- `sawDone` 守卫：流结束仍未收到 `done` → 抛错交给外层重连
+- 401 → 清 `localStorage` 的 token；其他 4xx/5xx → 解析后端 `detail` 并标记 `err.fatal = true`，
+  **外层不再退避重试**（业务错误重试只会白等）
+
+#### 3.3 `App.vue` —— `runStream` 统一入口
+
+把原来的 `send()` 抽成 `runStream(o: RunOpts)`，普通提问与续写共用同一套流式处理：
+
+```ts
+interface RunOpts {
+  text: string;
+  resume?: boolean;     // 透传给后端，决定走完整链路还是 generate 捷径
+  showUser?: boolean;   // false = 不渲染用户气泡（续写时用）
+  targetIdx?: number;   // 指定写入哪个气泡（续写时复用同一个）
+}
+```
+
+`send()` 和 `continueFrom()` 都只是它的薄封装：
+
+```ts
+function send() {
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  runStream({ text, showUser: true });
+}
+
+function continueFrom(idx: number) {
+  if (loading.value) return;
+  const m = messages.value[idx];
+  if ((m.continueCount ?? 0) >= CONTINUE_MAX_ROUNDS) {          // 本地先拦一次
+    retryHint.value = `本轮最多续写 ${CONTINUE_MAX_ROUNDS} 次，请直接追问新问题`;
+    return;
+  }
+  m.truncated = false;
+  runStream({ text: "继续", resume: true, showUser: false, targetIdx: idx });
+}
+```
+
+#### 3.4 续写时的状态处理
+
+| 项 | 处理 |
+|---|---|
+| `truncated` | `onTruncated` 置 `true`；`onDone` 里再用 `info.truncated` **兜底**一次 |
+| `continueCount` | 以服务端 `done` 事件回传的 `continue_count` 为准（前端本地计数只用于提前拦截） |
+| `meta`（缓存命中信息） | 续写**不覆盖**——检索信息来自上一轮，不是这次产生的 |
+| `onRetry` | 清空气泡内容。当前重试是「重新生成」而非真·断点续传，不清空会重复 |
+
+#### 3.5 渲染与截断提示
+
+| 项 | 实现 |
+|---|---|
+| 批量渲染 | `onToken` 只往 `buffer` 里攒，用 `requestAnimationFrame` 每帧 flush 一次，避免每个 token 触发一次响应式更新 |
+| 截断提示 | 气泡内渲染 `.truncated-bar`（橙色提示 + 「继续生成」按钮） |
+| 按钮禁用 | `loading`（生成中）或 `continueCount >= 3`（达上限）时置灰 |
+| 性能观测 | Console 输出 `[性能]首答/续写 tokens / 渲染次数 / 首字延迟 / 总耗时` |
+
+### 4. 完整时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant V as App.vue
+    participant A as api.ts
+    participant R as /chat/stream
+    participant C as checkpointer (SQLite)
+    participant G as generate
+
+    Note over U,G: 第一轮 —— 正常提问
+    U->>V: 输入问题
+    V->>A: chatStream(msg, undefined, token, resume=false)
+    A->>R: POST {message, thread_id: null}
+    R->>R: guard → rewrite → retrieve → generate → grade
+    R-->>A: event: max_length {"chars": 137}
+    A-->>V: onTruncated()
+    V->>V: m.truncated = true → 渲染「继续生成」
+    R-->>A: done {thread_id: "t1", truncated: true, continue_count: 0}
+    A-->>V: onDone() → threadId = "t1"
+    R->>C: 写入 state（含 truncated=true）
+
+    Note over U,G: 第二轮 —— 点「继续生成」
+    U->>V: 点击按钮
+    V->>V: 校验 continueCount < 3；不插用户气泡；复用同一气泡
+    V->>A: chatStream("继续", "t1", token, resume=true)
+    A->>R: POST {message: "继续", thread_id: "t1", resume: true}
+    R->>C: await graph.aget_state("t1")
+    C-->>R: {truncated: true, continue_count: 0, context: "...", messages: [...]}
+    R->>R: 四项校验通过 → graph_input{resume: true}
+    R->>G: START ==resume==> generate（跳过检索）
+    G-->>R: 从断点继续吐 token
+    R-->>A: {"token": "..."} × N
+    A-->>V: onToken() → rAF 批量追加到同一气泡
+    R-->>A: done {continue_count: 1, truncated: true}
+    A-->>V: onDone() → continueCount = 1
+```
+
+### 5. 设计取舍
+
+| 决策 | 原因 |
+|---|---|
+| 续写不显示用户气泡 | 「继续」是系统指令，不是用户输入，显示出来会污染对话 |
+| 续写复用同一气泡 | 续写内容是同一条回答的延续，新开气泡会把回答切成碎片 |
+| 续写跳过 Self-RAG 校验 | 校验不通过会触发重生成，把整段回答重写，续写等于白做 |
+| **不做对话摘要** | 半截答案还在 `messages` 里，模型自己会接着写；只有 `messages` 超出上下文窗口时才需要摘要（当前 `MAX_MESSAGES=20`，约 10 轮，短期内够用） |
+| 续写次数上限 3 | 续写成本是**平方级**增长：每续一次上下文就长一截（2k→6k→10k→14k），无上限会导致成本和延迟爆炸 |
+| 复用显式指令而非 prefill | DeepSeek 走 OpenAI 兼容协议，**不支持真正的 assistant prefill**（末尾 assistant 消息会被理解成"已说完"）。Anthropic / vLLM 才有 prefill，效果更好但此处不可用 |
+
+### 6. 已知风险与待补
+
+| 级别 | 项 | 说明 |
+|---|---|---|
+| 🟠 | **Overlap 重复** | 显式指令路线下模型有小概率把上一段结尾重说一遍，前端拼起来是肉眼可见的重复段落。需要服务端做重叠裁剪（比较 `prev` 结尾与 `new` 开头的最长公共子串并裁掉） |
+| 🟠 | **重试非真续传** | `onRetry` 走的是「重新生成 + 前端清空」，网络抖动会重烧 token。真正的不重复烧 token 需要服务端 token 缓冲（按 `stream_id` 缓存已产出文本）+ 客户端带 `offset` 重连 |
+| 🟠 | **IDOR** | 续写校验读取 checkpoint 时**未校验 `thread_id` 归属**，任意登录用户可续写/读取他人会话。应把 `thread_id` 改为 `{user}:{uuid}` 前缀并校验 |
+| 🟡 | 无速率限制 | `/chat/stream` 无频率限制，续写可被用来放大 token 消耗（当前只有 3 次上限兜底） |
+| 🟡 | 调试残留 | `doctor_agent/llm.py` 的 `max_tokens=50` 是测试截断用的，**上线前必须改回默认值** |
+
+### 7. 如何测试
+
+因为需要构造超长输出才能触发截断，最快的办法是把 `max_tokens` 临时调小：
+
+```python
+# doctor_agent/llm.py —— 仅测试用，测完删除
+_llm = init_chat_model(config.LLM_MODEL, max_tokens=50)
+```
+
+然后：
+
+| 步骤 | 预期 |
+|---|---|
+| 1. 登录后随便问一句 | 回答 1 秒内停住，气泡下方出现橙色 `⚠️ 内容较长，已被截断` + 「继续生成」 |
+| 2. F12 → Network → `stream` → Payload | `{ "message": "...", "thread_id": "...", "resume": false }` |
+| 3. 点「继续生成」 | **不出现用户气泡**；内容追加在**同一气泡**内 |
+| 4. 后端日志 | **完全没有** `[cache] 命中`，也没有检索 / 重排输出 |
+| 5. F12 → Network → `stream` → Payload | `{ "message": "继续", "thread_id": "...", "resume": true }` |
+| 6. Console 性能日志 | `[性能]续写 ... 首字: 0.4Xs`（应显著低于首答的 1.5~3s） |
+| 7. 连点 4 次 | 第 4 次按钮置灰 + 提示「已达续写上限，请追问新问题」 |
+
+也可以直接在 Network 面板的 EventStream 里看原始帧：
+
+```
+event: max_length
+data: {"reason":"length","chars":137}
+```
+
+**失败特征速查**：
+
+| 现象 | 原因 |
+|---|---|
+| `AttributeError: 'dict' object has no attribute 'CONTINUE_MAX_ROUNDS'` | `chat.py` 里局部变量 `config` 覆盖了模块名，应改用 `run_config` |
+| `NameError: name 'logger' is not defined` | 缺 `logger = logging.getLogger(__name__)`（只在异常分支触发，平时看不出来） |
+| `409 上一轮回答未被截断` | `generate_node` 没有把 `truncated` 写回 state |
+| 续写首字仍然 2 秒以上 | 请求没带 `resume: true`，后端仍走完整链路 |
+
+### 8. 涉及文件
+
+| 文件 | 改动 |
+|---|---|
+| `doctor_agent/config.py` | `CONTINUE_ENABLED` / `CONTINUE_MAX_ROUNDS` / `CONTINUE_PROMPT` |
+| `doctor_agent/state.py` | 新增 `resume` / `truncated` / `continue_count` |
+| `doctor_agent/nodes/generate.py` | 把 `truncated` 写回 state（供 checkpointer 持久化） |
+| `doctor_agent/graph.py` | `route_entry` + `route_after_generate`，START 条件入口、generate 出口分流 |
+| `api/schemas.py` | `ChatRequest.resume` |
+| `api/routers/chat.py` | 续写前置校验、`graph_input` 分支、`event: max_length` 推送 |
+| `doctor-agent-web/src/api.ts` | `resume` 透传、SSE `event:` 名解析、错误分类（`fatal`） |
+| `doctor-agent-web/src/App.vue` | `runStream` 统一入口、`continueFrom`、截断提示与上限拦截 |
+| `doctor-agent-web/src/style.css` | `.truncated-bar` / `.continue-btn` / `.truncated-hint` |
+
+---
+
+## 十、运行方式
 
 ### 1. 环境准备
 
@@ -356,6 +728,7 @@ uv sync
 
 # 检索缓存企业级测试套件（12 用例 + 缓存开关对照 + 风险探针，自动生成 md 报告）
 & ".\.venv\Scripts\python.exe" cache_test_suite.py --cache-mode both
+例子： 感冒需要吃什么药  和 感冒应该吃什么药
 ```
 
 ### 3. 启动 LangGraph Server
@@ -380,7 +753,7 @@ uv sync
 
 ---
 
-## 十、评测（RAGAS）
+## 十一、评测（RAGAS）
 
 `evaluate.py` 做五维量化评测：
 
@@ -399,7 +772,7 @@ uv sync
 
 ---
 
-## 十一、关键参数速查
+## 十二、关键参数速查
 
 | 参数 | 位置 | 值 |
 |---|---|---|
@@ -426,5 +799,8 @@ uv sync
 | `AUTH_USERNAME` | `config.py` | `admin`（登录账号） |
 | `AUTH_PASSWORD` | `config.py` | `admin@123`（登录密码） |
 | `AUTH_TOKEN` | `config.py` | 固定假 token（演示用；生产应换 JWT） |
+| `CONTINUE_ENABLED` | `config.py` | True（截断续写开关） |
+| `CONTINUE_MAX_ROUNDS` | `config.py` | 3（同一轮回答最多续写次数，防刷 + 控成本；前端 `App.vue` 的 `CONTINUE_MAX_ROUNDS` 需与之保持一致） |
+| `CONTINUE_PROMPT` | `config.py` | 续写指令（要求先补完被切断的句子、不重复、不加过渡语） |
 
 ---

@@ -365,6 +365,7 @@ LLM 单次输出受 `max_tokens` 限制。长回答会被**硬截断**——停�
 |---|---|---|
 | （默认） | `{"token": "增量文本"}` | 每收到一个 generate 节点的增量 token |
 | `event: max_length` | `{"reason": "length", "chars": 1234}` | 检测到 `finish_reason == "length"` |
+| `event: regenerate` | `{"attempt": "regenerate"}` | `feedback` 节点跑完、即将重新生成 —— **前端必须丢弃上一次尝试的内容** |
 | （默认） | `{"done": true, "thread_id": "...", "query": "...", "cache_hit": false, "cache_reason": "miss", "truncated": true, "continue_count": 0}` | 流正常结束 |
 | （默认） | `{"error": "服务暂时不可用，请稍后重试", "trace_id": "..."}` | 异常收尾 |
 
@@ -396,15 +397,17 @@ graph LR
     retrieve -->|"score≥0.6"| generate
     retrieve -->|"低分且未 HyDE"| hyde[hyde 假设答案] --> retrieve
     retrieve -->|"已 HyDE 仍低分"| web_search[web_search 联网兜底] --> generate
-    generate -->|resume=true| END
-    generate -->|resume=false| grade[grade Self-RAG 校验]
+    generate -->|"truncated 或 resume"| END
+    generate -->|正常首答| grade[grade Self-RAG 校验]
     grade -->|通过 / 达上限| END
     grade -->|不通过| feedback[feedback 反馈] --> generate
 ```
 
 - `route_entry()`：`state["resume"]` 为真 → 直连 `generate`，否则走 `guard`
-- `route_after_generate()`：续写生成完**直接 END**，不跑 Self-RAG 校验
-  （否则 `grade` 不通过会触发 `feedback → generate` 把整段回答重写一遍，续写就白做了）
+- `route_after_generate()`：**两条捷径直接 END**，都不跑 Self-RAG 校验
+  - `truncated` 为真 → 截断的答案必然不完整，拿它校验只会必然失败，
+    白烧 2 次生成 + 2 次 grader，而且重生成的半截答案会污染 `messages`
+  - `resume` 为真 → 校验不通过会触发 `feedback → generate` 把整段回答重写一遍，续写就白做了
 
 #### 2.4 为什么"跳过检索"是成立的
 
@@ -611,16 +614,47 @@ sequenceDiagram
     A-->>V: onDone() → continueCount = 1
 ```
 
-### 5. 设计取舍
+### 5. 边界与取舍
 
-| 决策 | 原因 |
-|---|---|
-| 续写不显示用户气泡 | 「继续」是系统指令，不是用户输入，显示出来会污染对话 |
-| 续写复用同一气泡 | 续写内容是同一条回答的延续，新开气泡会把回答切成碎片 |
-| 续写跳过 Self-RAG 校验 | 校验不通过会触发重生成，把整段回答重写，续写等于白做 |
-| **不做对话摘要** | 半截答案还在 `messages` 里，模型自己会接着写；只有 `messages` 超出上下文窗口时才需要摘要（当前 `MAX_MESSAGES=20`，约 10 轮，短期内够用） |
-| 续写次数上限 3 | 续写成本是**平方级**增长：每续一次上下文就长一截（2k→6k→10k→14k），无上限会导致成本和延迟爆炸 |
-| 复用显式指令而非 prefill | DeepSeek 走 OpenAI 兼容协议，**不支持真正的 assistant prefill**（末尾 assistant 消息会被理解成"已说完"）。Anthropic / vLLM 才有 prefill，效果更好但此处不可用 |
+#### 5.1 边界（系统能力到哪里为止）
+
+下表是**会改变系统行为的硬边界**，以及越界时的具体表现。
+
+| 边界 | 触发条件 | 越界行为 | 判定位置 |
+|---|---|---|---|
+| **续写次数** | `continue_count >= CONTINUE_MAX_ROUNDS`（3） | 前端按钮置灰 + 本地拦截（**0 请求**）；绕过前端则 `429 本轮最多续写 3 次` | `config.py` · `chat.py` · 前端 `constants.ts` |
+| 续写前提 | 上一轮 `truncated` 必须为真 | `409 上一轮回答未被截断，无需续写` | `chat.py` |
+| 续写身份 | `resume=true` 时必须带 `thread_id` | `400 续写必须携带 thread_id` | `chat.py` |
+| 空会话 | 该 thread 没有任何 `messages` | `409 该会话没有可续写的内容` | `chat.py` |
+| **截断即终止** | `state["truncated"]` 为真 | `generate → END`，**跳过 grade / feedback** | `graph.py` |
+| 续写即终止 | `state["resume"]` 为真 | `generate → END`，同样跳过校验 | `graph.py` |
+| **续写跳过检索** | `state["resume"]` 为真 | `START → generate`，跳过 guard / rewrite / retrieve / hyde / web_search | `graph.py` |
+| 历史长度 | `len(messages) > MAX_MESSAGES`（20） | 只把最近 20 条喂给 LLM，更早的被硬截掉 | `generate.py` |
+| 单次输出长度 | 模型的 `max_tokens` | 模型自己截断，`finish_reason == "length"` | 模型侧 |
+
+> **一句话记法**：续写是「复用上一轮的**上下文与检索结果**」，不是「复用上一轮的模型输出」。
+> 模型每次都是重新生成的，所以「跳过检索」省的是检索与前置节点，并**不是省 LLM 调用**。
+
+越界的 HTTP 状态码语义：
+
+| 码 | 含义 | 客户端该怎么做 |
+|---|---|---|
+| `400` | 请求本身不合法（未带 `thread_id`） | 修请求，不重试 |
+| `409` | 状态冲突（没什么可续写的） | 刷新会话状态，不重试 |
+| `429` | 超过续写次数上限 | 提示用户改问新问题，**不重试** |
+
+#### 5.2 取舍（每个决策的收益与代价）
+
+| 决策 | 收益 | 代价 |
+|---|---|---|
+| **续写次数上限 3** | 成本可控。续写成本是**平方级**增长（上下文 2k→6k→10k→14k），无上限会导致成本与延迟失控 | 超长回答在第 4 段后必须重新提问；阈值在前后端各写一份，改动要同步 |
+| **截断时不跑 Self-RAG 校验** | 省掉 2 次生成 + 2 次 grader（截断场景下这些调用**必然**失败）；`messages` 不被重生成的半截答案污染 | 截断的那一段**没有经过幻觉校验**；因为后续靠续写补齐，整条回答的校验覆盖度下降 |
+| **续写跳过检索** | 首字延迟从 ~2s 降到 ~0.6s；省掉 embedding + BM25 + CrossEncoder | 复用上一轮的 `context`，若知识库在此期间更新，续写段用的是旧资料 |
+| **续写复用同一气泡** | 用户看到的是一条完整回答，而不是碎片 | 前端要拼接多段内容，一旦出现重复（Overlap）就非常明显 |
+| **续写不显示用户气泡** | 「继续」是系统指令，显示出来会污染对话记录 | 消息列表与实际 `messages` 不同构（后端多收到几条 HumanMessage），调试时容易困惑 |
+| **不做对话摘要** | 实现简单。半截答案本来就在 `messages` 里，模型能自己接下去 | 只在 `MAX_MESSAGES=20`（约 10 轮）内有效；超出后早期上下文被硬截断，长会话会丢记忆 |
+| **显式指令而非 assistant prefill** | DeepSeek 走 OpenAI 兼容协议下的**唯一可行方案** | 模型有概率重复上一段结尾或加过渡语，需要额外的 Overlap 裁剪（见第 6 节） |
+| **校验失败时重生成（正常链路）** | 答案质量有兜底，幻觉率低 | 用户要多等 2 次生成的时间；且前几次尝试的内容也流过 SSE，需要 `event: regenerate` 让前端丢弃 |
 
 ### 6. 已知风险与待补
 
@@ -630,7 +664,8 @@ sequenceDiagram
 | 🟠 | **重试非真续传** | `onRetry` 走的是「重新生成 + 前端清空」，网络抖动会重烧 token。真正的不重复烧 token 需要服务端 token 缓冲（按 `stream_id` 缓存已产出文本）+ 客户端带 `offset` 重连 |
 | 🟠 | **IDOR** | 续写校验读取 checkpoint 时**未校验 `thread_id` 归属**，任意登录用户可续写/读取他人会话。应把 `thread_id` 改为 `{user}:{uuid}` 前缀并校验 |
 | 🟡 | 无速率限制 | `/chat/stream` 无频率限制，续写可被用来放大 token 消耗（当前只有 3 次上限兜底） |
-| 🟡 | 调试残留 | `doctor_agent/llm.py` 的 `max_tokens=50` 是测试截断用的，**上线前必须改回默认值** |
+| 🟡 | 截断答案未经校验 | 第 5.2 节取舍的直接后果。若要补，可在续写全部完成后对**拼接后**的完整答案跑一次校验 |
+| 🟡 | 测试用 `max_tokens` | `doctor_agent/llm.py` 里**没有**该参数；测试截断时临时加上，**测完必须删除**（它是全局生效的） |
 
 ### 7. 如何测试
 

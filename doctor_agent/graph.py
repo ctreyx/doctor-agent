@@ -39,12 +39,20 @@ def route_entry(state: State) -> str:
 
 
 def route_after_generate(state: State) -> str:
-    """生成后条件边：续写不再跑 Self-RAG 校验。
+    """生成后条件边：决定要不要跑 Self-RAG 校验。
 
-    续写内容是上一轮的延续，跑校验会触发 ``feedback → generate`` 重生成，
-    把整段回答重写一遍，续写就白做了。
+    两类情况直接结束，不校验：
+
+    - **被截断**（``truncated``）：截断的答案必然不完整，拿它去校验只会必然失败，
+      白烧 2 次生成 + 2 次 grader；而且重生成的半截答案会污染 ``messages``。
+      直接结束，交给用户点「继续生成」。
+    - **续写**（``resume``）：续写内容是上一轮的延续，校验不通过会触发
+      ``feedback → generate`` 把整段回答重写一遍，续写就白做了。
     """
-    return "end" if state.get("resume") else "grade"
+    if state.get("truncated") or state.get("resume"):
+        return "end"
+    return "grade"
+
 
 def build_graph(checkpointer=None):                    # ← 1
     """组装并编译医疗问答 Agent 图。"""

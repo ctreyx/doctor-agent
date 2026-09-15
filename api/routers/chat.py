@@ -44,8 +44,14 @@ async def chat_stream(req: ChatRequest):
 
     事件约定（每条都是 JSON）：
         {"token": "..."}                                          —— 增量文本
-        {"done": true, "thread_id": ..., "query": ..., "cache_hit": ..., "cache_reason": ...}  —— 结束
-        {"error": "..."}                                          —— 出错
+        event: max_length
+        {"reason": "length", "chars": 123}                        —— 输出撞到 max_tokens 被截断
+        event: regenerate
+        {"attempt": "regenerate"}                                 —— Self-RAG 校验不通过、开始重新生成
+                                                                     （前端必须丢弃上一次尝试的内容，否则多次尝试会拼在一起）
+        {"done": true, "thread_id": ..., "query": ..., "cache_hit": ..., "cache_reason": ...,
+         "truncated": ..., "continue_count": ...}                 —— 结束
+        {"error": "...", "trace_id": "..."}                       —— 出错
     """
     tid = req.thread_id or str(uuid4())
     run_config = {"configurable": {"thread_id": tid}}
@@ -89,16 +95,32 @@ async def chat_stream(req: ChatRequest):
         final_state: dict = {}
         truncated = False
         char_count = 0
+        regenerating = False   # feedback 节点跑过 → 紧接着的 generate 属于重生成
         try:
             async for mode, payload in graph.astream(
                 graph_input,
                 config=run_config,
-                stream_mode=["messages", "values"],
+                stream_mode=["messages", "values", "updates"],
             ):
+                # Self-RAG 校验不通过会走 feedback → generate 重来一遍，
+                # 而 stream_mode="messages" 会把**每一次** generate 的 token 都推出来。
+                # 这里把「feedback 跑过」记下来，在重生成的首个 token 前通知前端清空，
+                # 否则用户会看到多次尝试首尾相接的重复段落。
+                if mode == "updates":
+                    if "feedback" in (payload or {}):
+                        regenerating = True
+                    continue
+
                 if mode == "messages":
                     chunk, meta = payload
                     if meta.get("langgraph_node") != "generate":
                         continue
+
+                    if regenerating:
+                        regenerating = False
+                        char_count = 0
+                        truncated = False   # done 里的 truncated 只反映最后一次尝试
+                        yield _sse({"attempt": "regenerate"}, event="regenerate")
 
                     if chunk.content:
                         char_count += len(chunk.content)
